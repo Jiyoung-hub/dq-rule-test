@@ -1,0 +1,95 @@
+name: Collect DQ Review Metrics
+
+on:
+  pull_request:
+    types: [opened, edited, reopened, synchronize]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Read PR body and parse checkboxes
+        uses: actions/github-script@v6
+        id: parse
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const pr = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: context.payload.pull_request.number,
+            });
+
+            const body = pr.data.body || "";
+
+            // 특정 Heading 아래 섹션 추출
+            function parseGroup(heading) {
+              const re = new RegExp(`${heading}[\\s\\S]*?(?=###|$)`, 'i');
+              const m = body.match(re);
+              if (!m) return null;
+
+              const lines = m[0]
+                .split('\n')
+                .map(l => l.trim())
+                .filter(Boolean);
+
+              for (const line of lines) {
+                const ck = line.match(/^- \[(|x|X)\]\s*(.*)/);
+
+                if (ck) {
+                  return ck[2].trim();
+                }
+              }
+
+              return null;
+            }
+
+            core.setOutput("validity", parseGroup('### A. Validity') || "");
+            core.setOutput("relevance", parseGroup('### B. Relevence') || "");
+            core.setOutput("friction", parseGroup('### C. Friction') || "");
+
+      - name: Send metrics to endpoint
+        if: steps.parse.outputs.validity != ''
+        uses: actions/github-script@v6
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const fetch = require('node-fetch');
+
+            const payload = {
+              repo: process.env.GITHUB_REPOSITORY,
+              pr: context.payload.pull_request.number,
+              validity: "${{ steps.parse.outputs.validity }}",
+              relevance: "${{ steps.parse.outputs.relevance }}",
+              friction: "${{ steps.parse.outputs.friction }}",
+              actor: process.env.GITHUB_ACTOR,
+              timestamp: new Date().toISOString()
+            };
+
+            const endpoint = process.env.METRICS_ENDPOINT;
+
+            if (!endpoint) {
+              core.info("⚠️ METRICS_ENDPOINT not set; skipping sending metrics.");
+              return;
+            }
+
+            core.info(`Sending metrics to ${endpoint}`);
+            core.info(JSON.stringify(payload, null, 2));
+
+            const res = await fetch(endpoint, {
+              method: "POST",
+              headers: { "content-type": "application/json" },
+              body: JSON.stringify(payload),
+            });
+
+            if (!res.ok) {
+              core.setFailed(`❌ Failed to send metrics: ${res.status} ${res.statusText}`);
+            } else {
+              core.info("✅ Metrics successfully sent.");
+            }
+        env:
+          METRICS_ENDPOINT: ${{ secrets.METRICS_ENDPOINT }}
